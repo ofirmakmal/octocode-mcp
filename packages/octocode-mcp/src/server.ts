@@ -1,6 +1,10 @@
+import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Implementation } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'node:crypto';
+import { McpOAuth, type McpOAuthConfig, githubConnector } from 'mcp-s-oauth';
+import dotenv from 'dotenv';
 import { registerPrompts } from './mcp/prompts.js';
 import { registerSampling } from './mcp/sampling.js';
 import { clearAllCache } from './utils/cache.js';
@@ -9,19 +13,17 @@ import { registerFetchGitHubFileContentTool } from './mcp/tools/github_fetch_con
 import { registerSearchGitHubReposTool } from './mcp/tools/github_search_repos.js';
 import { registerSearchGitHubCommitsTool } from './mcp/tools/github_search_commits.js';
 import { registerSearchGitHubPullRequestsTool } from './mcp/tools/github_search_pull_requests.js';
-import { registerPackageSearchTool } from './mcp/tools/package_search/package_search.js';
 import { registerViewGitHubRepoStructureTool } from './mcp/tools/github_view_repo_structure.js';
 import { TOOL_NAMES } from './mcp/tools/utils/toolConstants.js';
 import { SecureCredentialStore } from './security/credentialStore.js';
-import {
-  getToken,
-  isEnterpriseTokenManager,
-  isCliTokenResolutionEnabled,
-} from './mcp/tools/utils/tokenManager.js';
 import { ConfigManager } from './config/serverConfig.js';
+import { AuditLogger } from './security/auditLogger.js';
 import { ToolsetManager } from './mcp/tools/toolsets/toolsetManager.js';
 import { isBetaEnabled } from './utils/betaFeatures.js';
 import { version, name } from '../package.json';
+
+// Load environment variables
+dotenv.config();
 
 const inclusiveTools =
   process.env.TOOLS_TO_RUN?.split(',')
@@ -34,18 +36,29 @@ const SERVER_CONFIG: Implementation = {
   version: version,
 };
 
+// Store transports by session ID
+const transports: Record<string, StreamableHTTPServerTransport> = {};
+
 async function startServer() {
   let shutdownInProgress = false;
   let shutdownTimeout: ReturnType<typeof setTimeout> | null = null;
 
   try {
-    const server = new McpServer(SERVER_CONFIG, {
-      capabilities: {
-        prompts: {},
-        tools: {},
-        ...(isBetaEnabled() && { sampling: {} }),
-      },
-    });
+    const app = express();
+
+    // Environment configuration for OAuth
+    const config: McpOAuthConfig = {
+      baseUrl: process.env.BASE_URL || 'http://localhost:3000',
+      clientId: process.env.GITHUB_CLIENT_ID!,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+      connector: githubConnector,
+    };
+
+    if (!config.clientId || !config.clientSecret) {
+      throw new Error(
+        'GitHub OAuth credentials are required. Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET environment variables.'
+      );
+    }
 
     // Initialize enterprise components if configured
     try {
@@ -66,26 +79,86 @@ async function startServer() {
       // Ignore enterprise initialization errors to avoid blocking startup
     }
 
-    // Initialize OAuth/GitHub App authentication
-    await initializeAuthentication();
+    // Define MCP handler function - this creates the MCP server
+    const mcpHandler = async (req: express.Request, res: express.Response) => {
+      // Check for existing session ID
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
 
-    await registerAllTools(server);
+      if (sessionId && transports[sessionId]) {
+        // Reuse existing transport
+        transport = transports[sessionId];
+      } else {
+        // Create new transport
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: sessionId => {
+            AuditLogger.logEvent({
+              action: 'mcp_session_initialized',
+              outcome: 'success',
+              source: 'system',
+              details: { sessionId },
+            });
+            transports[sessionId] = transport;
+          },
+        });
 
-    // Register prompts
-    registerPrompts(server);
+        // Clean up transport when closed
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            AuditLogger.logEvent({
+              action: 'mcp_session_closed',
+              outcome: 'success',
+              source: 'system',
+              details: { sessionId: transport.sessionId },
+            });
+            delete transports[transport.sessionId];
+          }
+        };
 
-    // Register sampling capabilities only if BETA features are enabled
-    if (isBetaEnabled()) {
-      registerSampling(server);
-    }
+        // Create MCP Server with all tools
+        const mcpServer = new McpServer(SERVER_CONFIG, {
+          capabilities: {
+            prompts: {},
+            tools: {},
+            ...(isBetaEnabled() && { sampling: {} }),
+          },
+        });
 
-    const transport = new StdioServerTransport();
+        // Register all tools
+        await registerAllTools(mcpServer);
 
-    await server.connect(transport);
+        // Register prompts
+        registerPrompts(mcpServer);
 
-    // Ensure all buffered output is sent
-    process.stdout.uncork();
-    process.stderr.uncork();
+        // Register sampling capabilities only if BETA features are enabled
+        if (isBetaEnabled()) {
+          registerSampling(mcpServer);
+        }
+
+        // Connect server to transport
+        await mcpServer.connect(transport);
+      }
+
+      // Handle the request using the original express request
+      await transport.handleRequest(req, res, req.body);
+    };
+
+    // Create MCP OAuth middleware
+    const mcpOAuth = McpOAuth(config, mcpHandler);
+
+    // Mount MCP OAuth middleware
+    app.use('/', mcpOAuth.router);
+
+    const port = parseInt(process.env.PORT || '3000');
+    const server = app.listen(port, () => {
+      AuditLogger.logEvent({
+        action: 'server_started',
+        outcome: 'success',
+        source: 'system',
+        details: { port },
+      });
+    });
 
     const gracefulShutdown = async (_signal?: string) => {
       // Prevent multiple shutdown attempts
@@ -106,6 +179,33 @@ async function startServer() {
         shutdownTimeout = setTimeout(() => {
           process.exit(1);
         }, 5000);
+
+        AuditLogger.logEvent({
+          action: 'server_shutting_down',
+          outcome: 'success',
+          source: 'system',
+          details: { port },
+        });
+
+        // Close all MCP transports
+        await Promise.all(
+          Object.values(transports).map(transport => {
+            try {
+              transport.close?.();
+              return Promise.resolve();
+            } catch (error) {
+              AuditLogger.logEvent({
+                action: 'transport_close_error',
+                outcome: 'failure',
+                source: 'system',
+                details: {
+                  error: error instanceof Error ? error.message : String(error),
+                },
+              });
+              return Promise.resolve();
+            }
+          })
+        );
 
         // Clear cache and credentials (fastest operations)
         clearAllCache();
@@ -130,20 +230,23 @@ async function startServer() {
           // Ignore shutdown errors
         }
 
-        // Close server with timeout protection
-        try {
-          await server.close();
-        } catch (closeError) {
-          // Error closing server
-        }
+        // Close Express server
+        server.close(() => {
+          AuditLogger.logEvent({
+            action: 'server_closed',
+            outcome: 'success',
+            source: 'system',
+            details: { port },
+          });
 
-        // Clear the timeout since we completed successfully
-        if (shutdownTimeout) {
-          clearTimeout(shutdownTimeout);
-          shutdownTimeout = null;
-        }
+          // Clear the timeout since we completed successfully
+          if (shutdownTimeout) {
+            clearTimeout(shutdownTimeout);
+            shutdownTimeout = null;
+          }
 
-        process.exit(0);
+          process.exit(0);
+        });
       } catch (_error) {
         // Error during graceful shutdown
 
@@ -161,11 +264,6 @@ async function startServer() {
     process.once('SIGINT', () => gracefulShutdown('SIGINT'));
     process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-    // Handle stdin close (important for MCP)
-    process.stdin.once('close', () => {
-      gracefulShutdown('STDIN_CLOSE');
-    });
-
     // Handle uncaught errors - prevent multiple handlers
     process.once('uncaughtException', _error => {
       gracefulShutdown('UNCAUGHT_EXCEPTION');
@@ -175,30 +273,9 @@ async function startServer() {
       gracefulShutdown('UNHANDLED_REJECTION');
     });
 
-    // Keep process alive
-    process.stdin.resume();
+    return server;
   } catch (_error) {
     process.exit(1);
-  }
-}
-
-/**
- * Initialize unified authentication system
- */
-async function initializeAuthentication(): Promise<void> {
-  try {
-    const { AuthenticationManager } = await import(
-      './auth/authenticationManager.js'
-    );
-    const authManager = AuthenticationManager.getInstance();
-    await authManager.initialize();
-  } catch (error) {
-    // Log error but don't fail startup - fall back to existing authentication
-    process.stderr.write(
-      `Warning: Failed to initialize authentication: ${
-        error instanceof Error ? error.message : String(error)
-      }\n`
-    );
   }
 }
 
@@ -208,17 +285,6 @@ export async function registerAllTools(server: McpServer) {
 
   // Initialize toolset management
   ToolsetManager.initialize(config.enabledToolsets, config.readOnly);
-
-  // Ensure token exists and is stored securely (existing behavior)
-  await getToken();
-
-  // Warn about CLI restrictions in enterprise mode
-  if (isEnterpriseTokenManager() && !isCliTokenResolutionEnabled()) {
-    // Use stderr for enterprise mode notification to avoid console linter issues
-    process.stderr.write(
-      '🔒 Enterprise mode active: CLI token resolution disabled for security\n'
-    );
-  }
 
   // Determine if we should run all tools or only specific ones
   const runAllTools = inclusiveTools.length === 0;
@@ -248,10 +314,11 @@ export async function registerAllTools(server: McpServer) {
       name: TOOL_NAMES.GITHUB_SEARCH_PULL_REQUESTS,
       fn: registerSearchGitHubPullRequestsTool,
     },
-    {
-      name: TOOL_NAMES.PACKAGE_SEARCH,
-      fn: registerPackageSearchTool,
-    },
+    // DO NOT RUN PACKAGE SEARCH TOOL IN SERVER MODE
+    // {
+    //   name: TOOL_NAMES.PACKAGE_SEARCH,
+    //   fn: registerPackageSearchTool,
+    // },
   ];
 
   let successCount = 0;
@@ -292,6 +359,17 @@ export async function registerAllTools(server: McpServer) {
   }
 }
 
-startServer().catch(() => {
-  process.exit(1);
-});
+// Start server if this file is run directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startServer().catch(error => {
+    AuditLogger.logEvent({
+      action: 'server_startup_error',
+      outcome: 'failure',
+      source: 'system',
+      details: {
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    process.exit(1);
+  });
+}

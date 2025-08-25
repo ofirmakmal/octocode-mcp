@@ -144,8 +144,33 @@ For organizations with advanced security, audit logging, and OAuth 2.0 authentic
 - **[Enterprise Setup Guide](./docs/AUTHENTICATION.md#-enterprise-features)** - Organization policies, audit logging, and security configuration
 - **[OAuth 2.0 Integration](./docs/AUTHENTICATION.md#-oauth-20-integration)** - How OAuth authentication works for organizations
 
-### 📚 Complete Authentication Guides
-- **[30-Second Setup](./docs/AUTHENTICATION_QUICK_REFERENCE.md)** - Quick reference for all authentication methods
+### 🧪 Beta Features (Experimental)
+
+Enable experimental features by setting `BETA=1` in your environment:
+
+```json
+{
+  "mcpServers": {
+    "octocode": {
+      "command": "npx",
+      "args": ["octocode-mcp"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_xxxxxxxxxxxx",
+        "BETA": "1"
+      }
+    }
+  }
+}
+```
+
+**Current Beta Features:**
+- **🤖 Code Explanation Sampling** - When fetching file contents, automatically generates prompts asking the LLM to explain what the code is doing
+- **📊 Enhanced Context Injection** - Provides additional context through MCP sampling protocol to improve response quality
+
+**Note:** Beta features are experimental and may change. Enable only for testing and development.
+
+### 📚 Complete Setup Guides
+- **[Installation Guide](./docs/INSTALLATION.md)** - Quick setup for all environments and deployment types
 - **[Complete Authentication Guide](./docs/AUTHENTICATION.md)** - Detailed setup for OAuth, GitHub Apps, and enterprise features
 
 ## 🔗 AI Assistant Integration
@@ -183,7 +208,7 @@ Octocode follows the standard Model Context Protocol, making it compatible with 
 ## 🚨 Troubleshooting & Help
 
 **Common Issues:**
-- **"No GitHub token found"** → See [Authentication Quick Reference](./docs/AUTHENTICATION_QUICK_REFERENCE.md)
+- **"No GitHub token found"** → See [Installation Guide](./docs/INSTALLATION.md)
 - **Rate limiting/Enterprise setup** → See [Complete Authentication Guide](./docs/AUTHENTICATION.md)
 - **MCP configuration help** → See examples above or [Complete Authentication Guide](./docs/AUTHENTICATION.md)
 
@@ -340,9 +365,10 @@ export TOOLS_TO_RUN="githubSearchCode,githubGetFileContent,githubViewRepoStructu
 ## 📚 Documentation
 
 ### Quick Links
+- 🚀 **[Installation Guide](./docs/INSTALLATION.md)** - Quick start and setup for all environments
 - 📚 **[Complete User Guide](./docs/USAGE_GUIDE.md)** - Examples and best practices
 - 🔐 **[Authentication Guide](./docs/AUTHENTICATION.md)** - Complete setup for all authentication methods
-- ⚡ **[Quick Setup Reference](./docs/AUTHENTICATION_QUICK_REFERENCE.md)** - 30-second authentication setup
+- 🌐 **[HTTP Server Guide](./docs/SERVER.md)** - Production deployment and OAuth setup
 - 🏗️ **[Technical Architecture](./docs/SUMMARY.md)** - System design and implementation
 - 🛠️ **[Tool Schemas](./docs/TOOL_SCHEMAS.md)** - Complete API reference
 
